@@ -1,0 +1,612 @@
+import numpy as np
+
+from ArcProblem import ArcProblem
+from ArcData import ArcData
+from ArcSet import ArcSet
+
+
+class ArcAgent:
+    def __init__(self):
+        """
+        You may add additional variables to this init. Be aware that it gets called only once
+        and then the solve method will get called several times.
+        """
+        pass
+        
+    def make_predictions(self, arc_problem: ArcProblem):
+        
+        def dihedral_transforms(arr: np.ndarray):
+            r0 = arr
+            r1 = np.rot90(arr, 1)
+            r2 = np.rot90(arr, 2)
+            r3 = np.rot90(arr, 3)
+            
+            #non-mirrored
+            yield ("R0", r0)
+            yield ("R90", r1)
+            yield ("R180", r2)
+            yield ("R270", r3)
+            
+            #mirrored (LR flip) after each rotation
+            yield ("R0_M", np.fliplr(r0))
+            yield ("R90_M", np.fliplr(r1))
+            yield ("R180_M", np.fliplr(r2))
+            yield ("R270_M", np.fliplr(r3))
+            
+        def apply_named_transform(arr: np.ndarray, name: str):
+            base = {"R0": arr,
+                    "R90": np.rot90(arr, 1),
+                    "R180": np.rot90(arr, 2),
+                    "R270": np.rot90(arr, 3)}[name.split("_")[0]]
+            if name.endswith("_M"):
+                base = np.fliplr(base)
+            return base
+        
+        def learn_color_map(src: np.ndarray, dst: np.ndarray):
+            if src.shape != dst.shape:
+                return None
+            mapping = {}
+            reverse = {}
+            s = src.ravel()
+            d = dst.ravel()
+            for i in range(s.size):
+                sc = int(s[i])
+                dc = int(d[i])
+                if sc in mapping:
+                    if mapping[sc] != dc:
+                        return None
+                else:
+                    #enforce bijection (two different s cannot map to same d)
+                    if dc in reverse and reverse[dc] != sc:
+                        return None
+                    mapping[sc] = dc
+                    reverse[dc] = sc
+            return mapping
+        
+        def compose_color_map(a, b):
+            #check if two learned maps are identical. If  acolor was unseen in one set, we ignore for equality. 
+            for k in set(a.keys()).intersection(b.keys()):
+                if a[k] != b[k]:
+                    return False
+            return True
+            
+        def apply_color_map(arr: np.ndarray, cmap: dict[int, int]):
+            table = np.arange(10, dtype=arr.dtype)
+            for k, v in cmap.items():
+                table[k] = v
+            return table[arr]
+            
+        def tight_bbox_of_noncolor(arr: np.ndarray, background: int):
+            ys, xs = np.where(arr != background)
+            if ys.size == 0:
+                return None
+            return int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+            
+        def grids_equal(a: np.ndarray, b: np.ndarray) -> bool:
+            return a.shape == b.shape and np.array_equal(a, b)
+            
+        def most_frequent_color(arr: np.ndarray):
+            vals, counts = np.unique(arr, return_counts=True)
+            return int(vals[counts.argmax()])
+        
+        #gathering training pairs
+        train_pairs: list[tuple[np.ndarray, np.ndarray]] = []
+        for p in arc_problem.training_set():
+            x = p.get_input_data().data()
+            y = p.get_output_data().data()
+            train_pairs.append((x, y))
+            
+        test_in = arc_problem.test_set().get_input_data().data()
+        
+        min_score = 0
+        candidates: list[tuple[int, np.ndarray]] = []
+        
+        def same_grid(a: np.ndarray, b: np.ndarray):
+            return a.shape == b.shape and np.array_equal(a, b)
+            
+        def add_candidate(score: int, grid: np.ndarray):
+            if score < min_score:
+                return
+                
+            for i, (s, g) in enumerate(candidates):
+                if same_grid(g, grid):
+                    if score > s:
+                        candidates[i] = (score, grid)
+                    return
+                    
+            if len(candidates) < 3:
+                candidates.append((score, grid))
+            else:
+                worst_idx = min(range(len(candidates)), key=lambda i: candidates[i][0])
+                if score > candidates[worst_idx][0]:
+                    candidates[worst_idx] = (score, grid)
+                    
+        def learn_output_shape():
+            if not train_pairs:
+                return None
+            H, W = train_pairs[0][1].shape
+            for _, y in train_pairs:
+                if y.shape != (H, W):
+                    return None
+            return (H, W)
+            
+        def foreground_mask(arr: np.ndarray, background: int):
+            return (arr != background)
+            
+        def cc_neighbors(y, x, H, W):
+            if y > 0: yield (y-1, x)
+            if y < H-1: yield (y+1, x)
+            if x > 0: yield (y, x-1)
+            if x < W-1: yield (y, x+1)
+            
+        def connected_components(arr: np.ndarray, background: int):
+            H, W = arr.shape
+            vis = np.zeros((H, W), dtype=bool)
+            comps = []
+            for y in range(H):
+                for x in range(W):
+                    if vis[y, x] or arr[y, x] == background:
+                        continue
+                    color = arr[y, x]
+                    stack = [(y, x)]
+                    vis[y, x] = True
+                    pixels = []
+                    miny = minx = 10**9
+                    maxy = maxx = -1
+                    while stack:
+                        cy, cx = stack.pop()
+                        pixels.append((cy, cx))
+                        if cy < miny: miny = cy
+                        if cx < minx: minx = cx
+                        if cy > maxy: maxy = cy
+                        if cx > maxx: maxx = cx
+                        for ny, nx in cc_neighbors(cy, cx, H, W):
+                            if not vis[ny, nx] and arr[ny, nx] == color:
+                                vis[ny, nx] = True
+                                stack.append((ny, nx))
+                    comps.append({
+                        "color": int(color),
+                        "pixels": pixels,
+                        "bbox": (miny, minx, maxy+1, maxx+1)
+            return comps
+            
+        def centroid_of_pixels(pixels):
+            if not pixels: return (0.0, 0.0)
+            sy = sum(py for py, _ in pixels)
+            sx = sum(px for _, px in pixels)
+            n = len(pixels)
+            return (sy / n, sx / n)
+            
+        def learn_translation(train_pairs, bg):
+            deltas = []
+            for x, y in train_pairs:
+                px = [(i,j) for i in range(x.shape[0]) for j in range(x.shape[1]) if x[i, j] != bg]
+                py = [(i,j) for i in range(y.shape[0]) for j in range(y.shape[1]) if y[i, j] != bg]
+                if not px or not py:
+                    return None
+                cyx, cxx = centroid_of_pixels(px)
+                cyy, cxy = centroid_of_pixels(py)
+                deltas.append( (round(cyy-cyx), round(cxy-cxx)) )
+            if all(d == deltas[0] for d in deltas):
+                return deltas[0]
+            return None
+            
+        def translate_foreground(inp: np.ndarray, bg: int, drow: int, dcol: int, out_shape=None):
+            H, W = inp.shape
+            if out_shape is None:
+                out_shape = (H, W)
+            OH, OW = out_shape
+            out = np.full((OH, OW), bg, dtype=inp.dtype)
+            for i in range(H):
+                for j in range(W):
+                    if inp[i, j] != bg:
+                        ni = i + drow
+                        nj = j + dcol
+                        if 0 <= ni < OH and 0 <= nj < OW:
+                            out[ni, nj] = inp[i, j]
+            return out
+            
+        def block_reduce_to_shape(inp: np.ndarray, target_h: int, target_w: int, bg: int):
+            H, W = inp.shape
+            if target_h <= 0 or target_w <= 0: return None
+            ry = H / target_h
+            rx = W / target_w
+            out = np.full((target_h, target_w), bg, dtype=inp.dtype)
+            for ty in range(target_h):
+                for tx in range(target_w):
+                    y0 = int(round(ty * ry))
+                    y1 = int(round((ty+1) * ry))
+                    x0 = int(round(tx * rx))
+                    x1 = int(round((tx+1) * rx))
+                    y0 = max(0, min(H, y0)); y1 = max(0, min(H, max(y0+1, y1)))
+                    x0 = max(0, min(W, x0)); x1 = max(0, min(W, max(x0+1, x1)))
+                    window = inp[y0:y1, x0:x1].ravel().tolist()
+                    if not window:
+                        continue
+                    counts = {}
+                    for c in window:
+                        counts[c] = counts.get(c, 0) + 1
+                    winner = max(counts.items(), key=lambda kv: (kv[0] != bg, kv[1]))[0]
+                    out[ty, tx] = winner
+            return out
+        def finalize_predictions():
+            candidates.sort(key=lambda t: t[0], reverse=True)
+            return [g for (s, g) in candidates]
+
+                
+        if not train_pairs:
+            add_candidate(0, test_in.copy())
+            return finalize_predictions()
+        learned_shape = learn_output_shape()
+        
+        def most_freq(arr):
+            vals, counts = np.unique(arr, return_counts=True)
+            return int(vals[np.argmax(counts)])
+        bg_out = None
+        if train_pairs:
+            outs = np.concatenate([y for _, y in train_pairs], axis=None)
+            bg_out = most_freq(outs)
+        else:
+            bg_out = most_freq(test_in)
+            
+        learned_palette = None
+        train_palette = None
+        if train_pairs:
+            learned_palette = set()
+            train_palette = set()
+            for x,y in train_pairs:
+                learned_palette.update(np.unique(y).tolist())
+                train_palette.update(np.unique(x).tolist())
+                train_palette.update(np.unique(y).tolist())
+                
+        d = learn_translation(train_pairs, bg_out)
+        if d is not None:
+            th, tw = learned_shape if learned_shape else test_in.shape
+            cand = translate_foreground(test_in, bg_out, d[0], d[1], (th, tw))
+            add_candidate( 2 + score_grid(cand), cand)
+            
+        if learned_shape and (learned_shape[0] <= test_in.shape[0] and learned_shape[1] <= test_in.shape[1]):
+            reduced = block_reduce_to_shape(test_in, learned_shape[0], learned_shape[1], bg_out)
+            if reduced is not None:
+                add_candidate( 2 + score_grid(reduced), reduced)
+                
+        def score_grid(grid: np.ndarray):
+            s = 0
+            if learned_shape and grid.shape == learned_shape:
+                s += 2
+            if learned_palette is not None:
+                pal = set(np.unique(grid).tolist())
+                if pal.issubset(learned_palette):
+                    s += 2
+            if train_palette is not None:
+                pal2 = set(np.unique(grid).tolist())
+                if pal2.issubset(train_palette):
+                    s += 1
+            return s
+        def learn_constant_output():
+            y0 = train_pairs[0][1]
+            for _, y in train_pairs:
+                if not grids_equal(y, y0):
+                    return None
+            return y0
+            
+        constY = learn_constant_output()
+        if constY is not None:
+            add_candidate(3, constY.copy())                      
+        # (1) Dihedral & color permutation
+        best_transform_name = None
+        best_global_cmap = None
+        
+        for name, _ in dihedral_transforms(train_pairs[0][0]):
+            global_map = {}
+            ok_all = True
+            for x, y in train_pairs:
+                x_t = apply_named_transform(x, name)
+                if x_t.shape != y.shape:
+                    ok_all = False
+                    break
+                cmap = learn_color_map(x_t, y)
+                if cmap is None:
+                    ok_all = False
+                    break
+                if global_map == {}:
+                    global_map = cmap
+                else:
+                    if not compose_color_map(global_map, cmap):
+                        ok_all = False
+                        break
+                    for k, v in cmap.items():
+                        if k not in global_map:
+                            global_map[k] = v
+            if ok_all and global_map is not None:
+                best_transform_name = name
+                best_global_cmap = global_map
+                break
+                
+        if best_transform_name is not None and best_global_cmap is not None:
+            pred = apply_color_map(apply_named_transform(test_in, best_transform_name), best_global_cmap)
+            add_candidate(3, pred)
+        
+        # Pure Geometric 
+        geom_name = None
+        for name, _ in dihedral_transforms(train_pairs[0][0]):
+            ok_all = True
+            for x, y in train_pairs:
+                if not grids_equal(apply_named_transform(x, name), y):
+                    ok_all = False
+                    break
+            if ok_all:
+                geom_name = name
+                break
+                
+        if geom_name is not None:
+            add_candidate(2, apply_named_transform(test_in, geom_name))
+            
+        bg_candidates = {most_frequent_color(x) for x, _ in train_pairs}
+        for bg in bg_candidates:
+            consistent = True
+            for x, y in train_pairs:
+                bb = tight_bbox_of_noncolor(x, bg)
+                if bb is None:
+                    consistent = False
+                    break
+                y0, y1, x0, x1 = bb
+                crop = x[y0:y1 + 1, x0:x1 + 1]
+                if not grids_equal(crop, y):
+                    consistent = False
+                    break
+            if consistent:
+                #Apply same crop rule to test input
+                bb_t = tight_bbox_of_noncolor(test_in, bg)
+                if bb_t is not None:
+                    y0, y1, x0, x1 = bb_t
+                    add_candidate(1, test_in[y0:y1 + 1, x0:x1 + 1])
+                break
+                
+        def edges_minmax_colorize(inp: np.ndarray, mode: str):
+            H, W = inp.shape
+            out = np.zeros_like(inp)
+            for y in range(H):
+                for x in range(W):
+                    c = inp[y, x]
+                    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        yy = y + dy
+                        xx = x + dx
+                        if 0 <= yy < H and 0 <= xx < W:
+                            d = inp[yy, xx]
+                            if d != c:
+                                out[y, x] = min(c, d) if mode == "min" else max(c, d)
+                                break
+            return out
+            
+        ok_min = True
+        for x, y in train_pairs:
+            if not grids_equal(edges_minmax_colorize(x, "min"), y):
+                ok_min = False
+                break
+        if ok_min:
+            add_candidate(2, edges_minmax_colorize(test_in, "min"))
+        else:
+            ok_max = True
+            for x, y in train_pairs:
+                if not grids_equal(edges_minmax_colorize(x, "max"), y):
+                    ok_max = False
+                    break
+            if ok_max:
+                add_candidate(2, edges_minmax_colorize(test_in, "max"))
+                
+        def edges_fixed_color(inp: np.ndarray, out_color: int):
+            H, W = inp.shape
+            out = np.zeros_like(inp)
+            for y in range(H):
+                for x in range(W):
+                    c = inp[y, x]
+                    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                        yy = y + dy
+                        xx = x + dx
+                        if 0 <= yy < H and 0 <= xx < W and inp[yy, xx] != c:
+                            out[y, x] = out_color
+                            break
+            return out
+            
+        outs_nonzero = []
+        for _, y in train_pairs:
+            u = np.unique(y)
+            u = u[u != 0]
+            if u.size > 0:
+                outs_nonzero.append(u)                
+        if len(outs_nonzero) > 0:
+            outs_nonzero = np.concatenate(outs_nonzero) if len(outs_nonzero) > 1 else outs_nonzero[0]
+            if outs_nonzero.size > 0:
+                colors, counts = np.unique(outs_nonzero, return_counts=True)
+                dominant = int(colors[np.argmax(counts)])
+                ok_dom = True
+                for x, y in train_pairs:
+                    if not grids_equal(edges_fixed_color(x, dominant), y):
+                        ok_dom = False
+                        break
+                if ok_dom:
+                    add_candidate(2, edges_fixed_color(test_in, dominant))
+        
+        
+        def block_pool_fill(inp: np.ndarray, marker: int, fill: int):
+            H, W = inp.shape
+            out = np.zeros((H, W), dtype=inp.dtype)
+            for by in range(0, H, 3):
+                for bx in range(0, W, 3):
+                    block = inp[by:by + 3, bx:bx + 3]
+                    if (block == marker).any():
+                        out[by:by + 3, bx:bx + 3] = fill
+            return out
+            
+        def learn_block_pooling():
+            x0, y0 = train_pairs[0]
+            in_colors = set(np.unique(x0)) - {0}
+            out_colors = set(np.unique(y0)) - {0}
+            for m in in_colors:
+                for f in out_colors:
+                    ok = True
+                    for x, y in train_pairs:
+                        if not grids_equal(block_pool_fill(x, m, f), y):
+                            ok = False
+                            break
+                    if ok:
+                        return (m, f)
+            return None
+            
+        bp = learn_block_pooling()
+        if bp is not None:
+            m, f = bp
+            add_candidate(2, block_pool_fill(test_in, m, f))
+            
+        def mod_fold_to_4x4(inp: np.ndarray, ignore: set[int], out_color: int):
+            H, W = inp.shape
+            out = np.zeros((4, 4), dtype=inp.dtype)
+            for r in range(H):
+                for c in range(W):
+                    val = inp[r, c]
+                    if val not in ignore:
+                        out[r % 4, c % 4] = out_color
+            return out
+            
+        def learn_mod_fold_rule():
+            nz_sets = []
+            for _, y in train_pairs:
+                nz_sets.append(set(np.unique(y)) - {0})
+            if not all(len(s) == 1 for s in nz_sets):
+                return None
+            out_color = list(nz_sets[0])[0]
+            candidate_ignores = [{0}, {0, 4}]
+            for ig in candidate_ignores:
+                ok = True
+                for x, y in train_pairs:
+                    if not grids_equal(mod_fold_to_4x4(x, ig, out_color), y):
+                        ok = False
+                        break
+                if ok:
+                    return (ig, out_color)
+            return None
+            
+        mf = learn_mod_fold_rule()
+        if mf is not None:
+            ig, oc = mf
+            add_candidate(2, mod_fold_to_4x4(test_in, ig, oc))
+            
+        def block_downscale_thresh(inp: np.ndarray, Hout: int, Wout: int, marker, fill: int, K: int):
+            Hin, Win = inp.shape
+            th = Hin // Hout
+            tw = Win // Wout
+            out = np.zeros((Hout, Wout), dtype=inp.dtype)
+            for by in range(Hout):
+                for bx in range(Wout):
+                    block = inp[by * th:(by + 1) * th, bx * tw:(bx + 1) * tw]
+                    if marker is None:
+                        cnt = int((block != 0).sum())
+                    else:
+                        cnt = int((block == marker).sum())
+                    if cnt >= K:
+                        out[by, bx] = fill
+            return out
+            
+        def learn_block_downscale_thresh():
+            x0, y0 = train_pairs[0]
+            Hin, Win = x0.shape
+            Hout, Wout = y0.shape
+            if Hin % Hout != 0 or Win % Wout != 0:
+                return None
+            out_colors = set().union(*(set(np.unique(y)) - {0} for _, y in train_pairs))
+            if not out_colors:
+                return None
+            in_colors = set().union(*(set(np.unique(x)) - {0} for x, _ in train_pairs))
+            th = Hin // Hout
+            tw = Win // Wout
+            area = th * tw
+            for fill in out_colors:
+                for marker in [None] + sorted(list(in_colors)):
+                    for K in range(1, area + 1):
+                        ok = True
+                        for x, y in train_pairs:
+                            pred = block_downscale_thresh(x, Hout, Wout, marker, fill, K)
+                            if not grids_equal(pred, y):
+                                ok = False
+                                break
+                        if ok:
+                            return (marker, fill, K, Hout, Wout)
+            return None
+            
+        bdt = learn_block_downscale_thresh()
+        if bdt is not None:
+            marker, fill, K, Hout, Wout = bdt
+            add_candidate(2, block_downscale_thresh(test_in, Hout, Wout, marker, fill, K))
+        
+        def is_border_only(y: np.ndarray):
+            H, W = y.shape
+            if H <= 2 or W <= 2:
+                return True
+            interior = y[1:H - 1, 1:W - 1]
+            return (interior == 0).mean() > 0.95
+            
+        def side_mode(vals: np.ndarray):
+            nz = vals[vals != 0]
+            if nz.size == 0:
+                return 0
+            colors, counts = np.unique(nz, return_counts=True)
+            return int(colors[np.argmax(counts)])
+        
+        def majority_border_colors():
+            for x, y in train_pairs:
+                if x.shape != y.shape or not is_border_only(y):
+                    return None
+            tops = []
+            bottoms = []
+            lefts = []
+            rights = []
+            for _, y in train_pairs:
+                H, W = y.shape
+                tops.append(side_mode(y[0, :]))
+                bottoms.append(side_mode(y[H - 1, :]))
+                lefts.append(side_mode(y[:, 0]))
+                rights.append(side_mode(y[:, W - 1]))
+            top = side_mode(np.array(tops))
+            bot = side_mode(np.array(bottoms))
+            left = side_mode(np.array(lefts))
+            right = side_mode(np.array(rights))
+            if top == 0 and bot == 0 and left == 0 and right == 0:
+                return None
+            return (top, bot, left, right)
+        def draw_frame(H: int, W: int, top: int, bot: int, left: int, right: int, dtype):
+            out = np.zeros((H, W), dtype=dtype)
+            if H == 0 or W == 0:
+                return out
+            out[0, :] = top
+            out[H - 1, :] = bot
+            out[:, 0] = left
+            out[:, W - 1] = right
+            return out
+        mbc = majority_border_colors()
+        if mbc is not None:
+            H, W = test_in.shape
+            top, bot, left, right = mbc
+            add_candidate(2, draw_frame(H, W, top, bot, left, right, test_in.dtype))
+
+        add_candidate(0, test_in)
+        add_candidate(0, np.rot90(test_in, 1))
+        add_candidate(0, np.rot90(test_in, 2))
+                    
+        return finalize_predictions()
+        
+        '''
+        Write the code in this method
+        to solve the incoming ArcProblem.
+
+        You can add up to THREE (3) the predictions to the
+        predictions list provided below that you need to
+        return at the end of this method.
+
+        In the Autograder, the test data output in the arc problem will be set to None
+        so your agent cannot peek at the answer.
+
+        Also, you shouldn't add more than 3 predictions to the list as
+        that is considered an ERROR and the test will be automatically
+        marked as incorrect.
+        '''
