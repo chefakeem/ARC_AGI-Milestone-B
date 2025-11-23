@@ -1,540 +1,516 @@
 import numpy as np
+from collections import deque, defaultdict
+from typing import List, Tuple, Dict, Optional, Set, Callable
 
-from ArcProblem import ArcProblem
-from ArcData import ArcData
-from ArcSet import ArcSet
+# =========================================================
+# Shared helpers
+# =========================================================
 
+def color_counts(arr: np.ndarray):
+    vals, counts = np.unique(arr, return_counts=True)
+    return dict(zip(vals, counts))
+
+def grid_score(pred: Optional[np.ndarray], target: np.ndarray) -> float:
+    if pred is None or pred.shape != target.shape:
+        return 0.0
+    return float(np.mean(pred == target))
+
+def count_components_by_color(arr: np.ndarray, ignore_colors=None):
+    """Return {color: number_of_components} using 4-connectivity."""
+    if ignore_colors is None:
+        ignore_colors = set()
+    else:
+        ignore_colors = set(ignore_colors)
+
+    h, w = arr.shape
+    visited = np.zeros_like(arr, dtype=bool)
+    comp_counts = defaultdict(int)
+
+    for r in range(h):
+        for c in range(w):
+            val = arr[r, c]
+            if val in ignore_colors or visited[r, c]:
+                continue
+
+            comp_counts[val] += 1
+            q = deque([(r, c)])
+            visited[r, c] = True
+
+            while q:
+                rr, cc = q.popleft()
+                for dr, dc in ((1,0),(-1,0),(0,1),(0,-1)):
+                    nr, nc = rr + dr, cc + dc
+                    if (0 <= nr < h and 0 <= nc < w and
+                        not visited[nr, nc] and arr[nr, nc] == val):
+                        visited[nr, nc] = True
+                        q.append((nr, nc))
+
+    return dict(comp_counts)
+
+def connected_components(arr: np.ndarray, colors: Set[int]) -> List[List[Tuple[int,int]]]:
+    """Components for pixels whose value is in colors (4-connectivity)."""
+    h, w = arr.shape
+    visited = np.zeros_like(arr, dtype=bool)
+    comps = []
+    for r in range(h):
+        for c in range(w):
+            if not visited[r,c] and arr[r,c] in colors:
+                col = arr[r,c]
+                q=deque([(r,c)])
+                visited[r,c]=True
+                cells=[]
+                while q:
+                    rr,cc=q.popleft()
+                    cells.append((rr,cc))
+                    for dr,dc in ((1,0),(-1,0),(0,1),(0,-1)):
+                        nr,nc=rr+dr,cc+dc
+                        if 0<=nr<h and 0<=nc<w and not visited[nr,nc] and arr[nr,nc]==col:
+                            visited[nr,nc]=True
+                            q.append((nr,nc))
+                comps.append(cells)
+    return comps
+
+def bbox(cells: List[Tuple[int,int]]) -> Tuple[int,int,int,int]:
+    rs=[r for r,_ in cells]
+    cs=[c for _,c in cells]
+    return min(rs), max(rs), min(cs), max(cs)
+
+def dihedral_transforms(mask: np.ndarray) -> List[np.ndarray]:
+    """All 8 rotations/flips of a binary mask (unique)."""
+    outs=[]
+    for k in range(4):
+        rot=np.rot90(mask,k)
+        outs.append(rot)
+        outs.append(np.fliplr(rot))
+    uniq=[]
+    for m in outs:
+        if not any(np.array_equal(m,u) for u in uniq):
+            uniq.append(m)
+    return uniq
+
+
+# =========================================================
+# Preprocessing / noise removal
+# =========================================================
+
+def detect_background(x: np.ndarray) -> int:
+    vals, counts = np.unique(x, return_counts=True)
+    return int(vals[np.argmax(counts)])
+
+def remove_background(x: np.ndarray):
+    bg = detect_background(x)
+    y = x.copy()
+    y[y == bg] = 0
+    return y, bg
+
+def strip_grid_lines(x: np.ndarray):
+    """
+    Remove dominant nonzero color ONLY if it forms full separator rows/cols.
+    """
+    y = x.copy()
+    h, w = y.shape
+    nz = y[y != 0]
+    if nz.size == 0:
+        return y, None
+
+    vals, counts = np.unique(nz, return_counts=True)
+    line_color = int(vals[np.argmax(counts)])
+
+    full_rows = [r for r in range(h) if np.all(y[r, :] == line_color)]
+    full_cols = [c for c in range(w) if np.all(y[:, c] == line_color)]
+
+    if len(full_rows) + len(full_cols) == 0:
+        return y, None
+
+    y[y == line_color] = 0
+    return y, line_color
+
+def filter_tiny_components(x: np.ndarray, min_size: Optional[int]=None):
+    """
+    Drop tiny components (noise).
+    min_size dynamic if None.
+    """
+    h, w = x.shape
+    if min_size is None:
+        min_size = max(2, (h*w)//200)
+
+    y = x.copy()
+    visited = np.zeros_like(x, dtype=bool)
+
+    for r in range(h):
+        for c in range(w):
+            if x[r,c] != 0 and not visited[r,c]:
+                color = x[r,c]
+                q=deque([(r,c)])
+                visited[r,c]=True
+                cells=[]
+                while q:
+                    rr,cc=q.popleft()
+                    cells.append((rr,cc))
+                    for dr,dc in ((1,0),(-1,0),(0,1),(0,-1)):
+                        nr,nc=rr+dr,cc+dc
+                        if 0<=nr<h and 0<=nc<w and not visited[nr,nc] and x[nr,nc]==color:
+                            visited[nr,nc]=True
+                            q.append((nr,nc))
+                if len(cells) < min_size:
+                    for rr,cc in cells:
+                        y[rr,cc] = 0
+    return y
+
+def make_views(x: np.ndarray) -> List[Tuple[str, np.ndarray]]:
+    """
+    Produce multiple cleaned versions of x.
+    Solvers can be scored on each view.
+    """
+    views = [("raw", x)]
+
+    gx, _ = strip_grid_lines(x)
+    if not np.array_equal(gx, x):
+        views.append(("grid_stripped", gx))
+
+    tx = filter_tiny_components(x)
+    if not np.array_equal(tx, x):
+        views.append(("tiny_filtered", tx))
+
+    bx, _ = remove_background(x)
+    if not np.array_equal(bx, x):
+        views.append(("bg_removed", bx))
+
+    return views
+
+
+# =========================================================
+# Heuristic 1: component summary (81-family)
+# =========================================================
+
+def heuristic_component_summary(x: np.ndarray) -> np.ndarray:
+    counts = color_counts(x)
+    nonzero = {k:v for k,v in counts.items() if k!=0}
+    if not nonzero:
+        return np.zeros((1,1), dtype=int)
+
+    grid_color = max(nonzero, key=nonzero.get)
+
+    comps = count_components_by_color(x, ignore_colors={0, grid_color})
+    if not comps:
+        return np.zeros((1,1), dtype=int)
+
+    items = sorted(comps.items(), key=lambda kv:(kv[1], kv[0]))
+    max_len = max(c for _,c in items)
+
+    out = np.zeros((len(items), max_len), dtype=int)
+    for r,(color,cnt) in enumerate(items):
+        out[r,:cnt] = color
+    return out
+
+
+# =========================================================
+# Heuristic 2: shape packing into slots (67-family)
+# =========================================================
+
+def detect_ground_color(x: np.ndarray) -> int:
+    h,w = x.shape
+    bottom = x[max(0,h-2):h,:]
+    vals, counts = np.unique(bottom[bottom!=0], return_counts=True)
+    if len(vals)==0:
+        vals2, counts2 = np.unique(x[x!=0], return_counts=True)
+        return int(vals2[np.argmax(counts2)]) if len(vals2)>0 else 0
+    return int(vals[np.argmax(counts)])
+
+def get_shapes_above_ground(x: np.ndarray, ground_color: int) -> List[Dict]:
+    colors = set(np.unique(x)) - {0, ground_color}
+    comps = connected_components(x, colors)
+    shapes=[]
+    for cells in comps:
+        col = x[cells[0]]
+        r0,r1,c0,c1 = bbox(cells)
+        grid = np.zeros((r1-r0+1, c1-c0+1), dtype=int)
+        for r,c in cells:
+            grid[r-r0, c-c0] = col
+        shapes.append({
+            "color": int(col),
+            "bbox": (r0,r1,c0,c1),
+            "mask": (grid!=0).astype(int)
+        })
+    shapes.sort(key=lambda s: (s["bbox"][2], s["bbox"][0]))
+    return shapes
+
+def get_slot_mask(x: np.ndarray, ground_color: int) -> np.ndarray:
+    h,w = x.shape
+    slot = np.zeros_like(x, dtype=bool)
+    slot |= (x == ground_color)
+    for r in range(h-1):
+        above = (x[r,:] != 0)
+        below_ground = (x[r+1,:] == ground_color)
+        slot[r,:] |= (above & below_ground)
+    return slot
+
+def slot_components(slot_mask: np.ndarray) -> List[List[Tuple[int,int]]]:
+    h,w = slot_mask.shape
+    visited=np.zeros_like(slot_mask, dtype=bool)
+    comps=[]
+    for r in range(h):
+        for c in range(w):
+            if slot_mask[r,c] and not visited[r,c]:
+                q=deque([(r,c)])
+                visited[r,c]=True
+                cells=[]
+                while q:
+                    rr,cc=q.popleft()
+                    cells.append((rr,cc))
+                    for dr,dc in ((1,0),(-1,0),(0,1),(0,-1)):
+                        nr,nc=rr+dr,cc+dc
+                        if 0<=nr<h and 0<=nc<w and slot_mask[nr,nc] and not visited[nr,nc]:
+                            visited[nr,nc]=True
+                            q.append((nr,nc))
+                comps.append(cells)
+    comps.sort(key=lambda cells: min(c for _,c in cells))
+    return comps
+
+def place_shape_on_slot(slot_cells, shape_mask):
+    srs=[r for r,_ in slot_cells]
+    scs=[c for _,c in slot_cells]
+    rmin,rmax,cmin,cmax=min(srs),max(srs),min(scs),max(scs)
+    sh, sw = shape_mask.shape
+
+    if sh != (rmax-rmin+1) or sw != (cmax-cmin+1):
+        return None
+
+    slot_bbox_mask = np.zeros((sh,sw), dtype=int)
+    for r,c in slot_cells:
+        slot_bbox_mask[r-rmin, c-cmin] = 1
+
+    if np.array_equal(slot_bbox_mask, shape_mask):
+        return (rmin, cmin)
+    return None
+
+def backtrack_assign(shapes, slots, x, ground_color):
+    used=[False]*len(slots)
+    placements=[]
+
+    def rec(i):
+        if i==len(shapes):
+            out = np.zeros_like(x)
+            out[x==ground_color]=ground_color
+            for shape_idx, slot_idx, (r0,c0), mask in placements:
+                color=shapes[shape_idx]["color"]
+                sh,sw=mask.shape
+                for rr in range(sh):
+                    for cc in range(sw):
+                        if mask[rr,cc]:
+                            out[r0+rr, c0+cc]=color
+            return out
+
+        base_mask=shapes[i]["mask"]
+        for tmask in dihedral_transforms(base_mask):
+            for j,slot_cells in enumerate(slots):
+                if used[j]:
+                    continue
+                top_left = place_shape_on_slot(slot_cells, tmask)
+                if top_left is None:
+                    continue
+                used[j]=True
+                placements.append((i,j,top_left,tmask))
+                res=rec(i+1)
+                if res is not None:
+                    return res
+                placements.pop()
+                used[j]=False
+        return None
+
+    return rec(0)
+
+def heuristic_shape_pack_slots(x: np.ndarray):
+    ground_color = detect_ground_color(x)
+    shapes = get_shapes_above_ground(x, ground_color)
+    slots = slot_components(get_slot_mask(x, ground_color))
+    if not shapes or not slots:
+        return None
+    return backtrack_assign(shapes, slots, x, ground_color)
+
+
+# =========================================================
+# Heuristic 3: grid tile template completion (2546-family)
+# =========================================================
+
+def find_full_line_indices(arr, line_color):
+    h,w = arr.shape
+    horiz = [r for r in range(h) if np.all(arr[r,:]==line_color)]
+    vert  = [c for c in range(w) if np.all(arr[:,c]==line_color)]
+    return horiz, vert
+
+def tile_ranges(size, separators):
+    seps = [-1] + sorted(separators) + [size-1]
+    ranges=[]
+    for i in range(len(seps)-1):
+        start = seps[i]+1
+        end   = seps[i+1]-1
+        if start<=end:
+            ranges.append((start,end))
+    return ranges
+
+def extract_tiles(arr, line_color):
+    hr, vc = find_full_line_indices(arr, line_color)
+    rr = tile_ranges(arr.shape[0], hr)
+    cc = tile_ranges(arr.shape[1], vc)
+    tiles=[]
+    for r0,r1 in rr:
+        for c0,c1 in cc:
+            tiles.append(((r0,r1,c0,c1), arr[r0:r1+1, c0:c1+1]))
+    return tiles
+
+def dihedral_grids(grid):
+    outs=[]
+    for k in range(4):
+        rot=np.rot90(grid,k)
+        outs.append(rot)
+        outs.append(np.fliplr(rot))
+    uniq=[]
+    for g in outs:
+        if not any(np.array_equal(g,u) for u in uniq):
+            uniq.append(g)
+    return uniq
+
+def heuristic_tile_template_completion(x: np.ndarray) -> Optional[np.ndarray]:
+    nz = x[x != 0]
+    if nz.size == 0:
+        return None
+    vals, counts = np.unique(nz, return_counts=True)
+    line_color = int(vals[np.argmax(counts)])
+
+    hr, vc = find_full_line_indices(x, line_color)
+    if len(hr) + len(vc) == 0:
+        return None
+
+    tiles = extract_tiles(x, line_color)
+    if not tiles:
+        return None
+
+    def motif_mask(tile):
+        return (tile != 0) & (tile != line_color)
+
+    tile_infos=[]
+    for bbox_, tile in tiles:
+        mm = motif_mask(tile)
+        tile_infos.append((bbox_, tile, mm, int(mm.sum())))
+
+    template_bbox, template_tile, template_mm, _ = max(tile_infos, key=lambda t: t[3])
+    if template_mm.sum() == 0:
+        return None
+
+    template_colors = sorted(set(np.unique(template_tile)) - {0, line_color})
+    out = x.copy()
+
+    template_masks_by_color = {}
+    for col in template_colors:
+        base_mask = (template_tile == col).astype(int)
+        template_masks_by_color[col] = dihedral_grids(base_mask)
+
+    for bbox_, tile, mm, _ in tile_infos:
+        r0,r1,c0,c1 = bbox_
+        tile_out = tile.copy()
+
+        for col in template_colors:
+            current = (tile == col).astype(int)
+            if current.sum() == 0:
+                continue
+
+            best_t = None
+            for tmask in template_masks_by_color[col]:
+                # IMPORTANT: only compare same-sized masks
+                if tmask.shape != current.shape:
+                    continue
+
+                if np.all((current == 1) <= (tmask == 1)):
+                    best_t = tmask
+                    break
+
+            if best_t is not None:
+                fill_locations = (best_t == 1) & (current == 0)
+                tile_out[fill_locations] = col
+
+        out[r0:r1+1, c0:c1+1] = tile_out
+
+    return out
+
+
+
+# =========================================================
+# Scoring + selection (THRESH=0.80)
+# =========================================================
+
+THRESH = 0.80
+MAX_PREDS = 3
+
+def score_heuristic_on_training(problem, fn: Callable[[np.ndarray], Optional[np.ndarray]]) -> float:
+    """
+    For each training pair: try heuristic on multiple views; keep best score.
+    Mean over training pairs is returned.
+    """
+    scores=[]
+    for s in problem.training_set():
+        x = s.get_input_data().data()
+        y = s.get_output_data().data()
+
+        best = 0.0
+        for _, view in make_views(x):
+            pred = fn(view)
+            best = max(best, grid_score(pred, y))
+        scores.append(best)
+
+    return float(np.mean(scores)) if scores else 0.0
+
+def choose_predictions(problem) -> List[np.ndarray]:
+    """
+    Define heuristics locally (no global list), score them, pick best ≥ THRESH.
+    """
+    heuristics = [
+        ("component_summary", heuristic_component_summary),
+        ("shape_pack_slots", heuristic_shape_pack_slots),
+        ("tile_template_completion", heuristic_tile_template_completion),
+    ]
+
+    ranked=[]
+    for name, fn in heuristics:
+        sc = score_heuristic_on_training(problem, fn)
+        ranked.append((sc, name, fn))
+
+    ranked.sort(reverse=True, key=lambda t: t[0])
+
+    test_in = problem.test_set().get_input_data().data()
+    preds=[]
+
+    for sc, name, fn in ranked:
+        if sc < THRESH:
+            continue
+
+        for _, v in make_views(test_in):
+            pred = fn(v)
+            if pred is None:
+                continue
+            if not any(np.array_equal(pred, p) for p in preds):
+                preds.append(pred)
+            if len(preds) >= MAX_PREDS:
+                break
+        if len(preds) >= MAX_PREDS:
+            break
+
+    return preds
+
+
+# =========================================================
+# ArcAgent
+# =========================================================
 
 class ArcAgent:
     def __init__(self):
-        """
-        You may add additional variables to this init. Be aware that it gets called only once
-        and then the solve method will get called several times.
-        """
-        
-        self.MAX_DEPTH = 2
-        self.BEAM_WIDTH = 12
-        self.TOP_K_OPS = 6
-        
-    def make_predictions(self, arc_problem: ArcProblem):
-        
-        
-        
-        def grids_equal(a: np.ndarray, b: np.ndarray):
-            return isinstance(a, np.ndarray) and isinstance(b, np.ndarray) and a.shape == b.shape and np.array_equal(a, b)
-            
-        def most_freq(arr: np.ndarray):
-            if arr.size == 0:
-                return 0
-            v, c = np.unique(arr, return_counts=True)
-            return int(v[c.argmax()])
-            
-        def pixel_loss(a: np.ndarray, b: np.ndarray):
-            if a.shape != b.shape:
-                return 10**9
-            return int(np.sum(a != b))
-        def shape_match(a: np.ndarray, b: np.ndarray):
-            return int(a.shape == b.shape)
-        def cc4_info(g: np.ndarray):
-            H, W = g.shape
-            seen = np.zeros_like(g, dtype=bool)
-            comps = []
-            for r in range(H):
-                for c in range(W):
-                    if g[r, c] == 0 or seen[r, c]:
-                        continue
-                    col = int(g[r, c])
-                    stack = [(r, c)]
-                    seen[r, c] = True
-                    coords = []
-                    sr = sc = n = 0
-                    minr = minc = 10**9
-                    maxr = maxc = -10**9
-                    while stack:
-                        y, x = stack.pop()
-                        coords.append((y, x))
-                        sr += y; sc += x; n += 1
-                        if y<minr: minr=y
-                        if y>maxr: maxr=y
-                        if x<minc: minc=x
-                        if x>maxc: maxc=x
-                        for dy, dx in ((1,0),(-1,0),(0,1),(0,-1)):
-                            ny, nx = y+dy, x+dx
-                            if 0<=ny<H and 0<=nx<W and not seen[ny, nx] and g[ny, nx]==col:
-                                seen[ny, nx] = True
-                                stack.append((ny, nx))
-                    cy, cx = sr/n, sc/n
-                    comps.append({"coords": coords,
-                                  "color": col,
-                                  "size": n,
-                                  "bbox": (minr, minc, maxr, maxc),
-                                  "centroid": (cy, cx)})
-            return comps
-            
-            
-        def apply_seq(g: np.ndarray, seq: list):
-            out = g
-            for op in seq:
-                out = op(out)      
-            return out
-        
-        def sequence_fits_all(train_pairs: list, seq: list):
-            tot = 0
-            fails = 0
-            for x, y in train_pairs:
-                pred = apply_seq(x, seq)
-                L = pixel_loss(pred, y)
-                tot += L
-                if L > 0:
-                    fails += 1
-            return tot, fails
-        def dihedral_names():
-            return ("I","R90","R180","R270","FH","FV","FD","FA")
-        def op_dihedral(name: str):
-            def f(g: np.ndarray):
-                if name == "I":   return g.copy()
-                if name == "R90": return np.rot90(g, 1)
-                if name == "R180":return np.rot90(g, 2)
-                if name == "R270":return np.rot90(g, 3)
-                if name == "FH":  return np.flip(g, 1)
-                if name == "FV":  return np.flip(g, 0)
-                if name == "FD":  return np.transpose(g)
-                if name == "FA":  return np.flip(np.transpose(g), 1)
-                return g.copy()
-            return f
-            
-            
-        def compress_left(a: np.ndarray, bg: int=0):
-            H, W = a.shape
-            out = np.full_like(a, bg)
-            for r in range(H):
-                nz = a[r][a[r] != bg]
-                if nz.size:
-                    out[r, :nz.size] = nz
-            return out
-        def compress_up(a: np.ndarray, bg: int=0):
-            H, W = a.shape
-            out = np.full_like(a, bg)
-            for c in range(W):
-                col = a[:, c]
-                nz = col[col != bg]
-                if nz.size:
-                    out[:nz.size, c] = nz
-            return out
-            
-        def op_compress_left(bg: int=0): return lambda g: compress_left(g, bg)
-        def op_compress_up(bg: int=0):   return lambda g: compress_up(g, bg)
-        
-        
-        def translate(a: np.ndarray, dy: int, dx: int, bg: int=0):
-            H, W = a.shape
-            out = np.full_like(a, bg)
-            y0 = max(0, dy); x0 = max(0, dx)
-            y1 = min(H, H+dy); x1 = min(W, W+dx)
-            sy0 = -min(0, dy); sx0 = -min(0, dx)
-            if y0 < y1 and x0 < x1:
-                out[y0:y1, x0:x1] = a[sy0:sy0+(y1-y0), sx0:sx0+(x1-x0)]
-            return out
-        def op_translate(dy: int, dx: int, bg: int=0): return lambda g: translate(g, dy, dx, bg)
-        
-        
-        def object_repaint(a: np.ndarray, color: int):
-            out = a.copy()
-            comps = cc4_info(a)
-            if not comps:
-                return out
-            comps.sort(key=lambda t: t["size"], reverse=True)
-            for (r,c) in comps[0]["coords"]:
-                out[r, c] = color
-            return out
-        def op_object_repaint(color: int): return lambda g: object_repaint(g, color)
-        
-        def cmap_from_xy(x: np.ndarray, y: np.ndarray):
-            if x.shape != y.shape:
-                return None
-            cm = {}
-            for xv, yv in zip(x.ravel(), y.ravel()):
-                xv = int(xv); yv = int(yv)
-                if xv not in cm:
-                    cm[xv] = yv
-                elif cm[xv] != yv:
-                    return None
-            return cm
-        def apply_cmap(arr: np.ndarray, cmap: dict[int,int]):
-            table = np.arange(10, dtype=arr.dtype)
-            for k,v in cmap.items():
-                if 0<=k<10 and 0<=v<10:
-                    table[k] = v
-            return table[arr]
-            
-        def repeat_upscale(a: np.ndarray, kh: int, kw: int):
-            return np.kron(a, np.ones((kh, kw), dtype=a.dtype))
-            
-        def try_infer_repeat_xy(train_pairs):
-            kh_set, kw_set = set(), set()
-            for x, y in train_pairs:
-                Hx, Wx = x.shape
-                Hy, Wy = y.shape
-                if Hy % Hx != 0 or Wy % Wx != 0:
-                    return None
-                kh, kw = Hy // Hx, Wy // Wx
-                if not grids_equal(repeat_upscale(x, kh, kw), y):
-                    return None
-                kh_set.add(kh); kw_set.add(kw)
-            if len(kh_set) == 1 and len(kw_set) == 1:
-                return (next(iter(kh_set)), next(iter(kw_set)))
-            return None
-        def block_downscale_mode_zero_exclusive(a: np.ndarray, h: int, w: int):
-            H, W = a.shape
-            assert H % h == 0 and W % w == 0
-            bh, bw = H//h, W//w
-            out = np.zeros((h,w), dtype=a.dtype)
-            for i in range(h):
-                for j in range(w):
-                    tile = a[i*bh:(i+1)*bh, j*bw:(j+1)*bw].ravel()
-                    tile = tile[tile != 0]
-                    if tile.size == 0:
-                        out[i,j] = 0
-                    else:
-                        v, c = np.unique(tile, return_counts=True)
-                        out[i,j] = int(v[c.argmax()])
-            return out
-        def block_downscale_mode_zero_inclusive(a: np.ndarray, h: int, w: int):
-            H, W = a.shape
-            assert H % h == 0 and W % w == 0
-            bh, bw = H // h, W // w
-            out = np.zeros((h, w), dtype=a.dtype)
-            for i in range(h):
-                for j in range(w):
-                    tile = a[i*bh:(i+1)*bh, j*bw:(j+1)*bw].ravel()
-                    v, c = np.unique(tile, return_counts=True)
-                    out[i, j] = int(v[c.argmax()])
-            return out
-        def try_infer_downscale(train_pairs, sizes=((4,4), (3,3), (2,2))):
-            for (hh, ww) in sizes:
-                ok = True
-                for x, y in train_pairs:
-                    Hx, Wx = x.shape
-                    if Hx % hh != 0 or Wx % ww != 0:
-                        ok = False; break
-                    if not grids_equal(block_downscale_mode_zero_exclusive(x, hh, ww), y):
-                        ok = False; break
-                if ok:
-                    return lambda g, hh=hh, ww=ww: block_downscale_mode_zero_exclusive(g, hh, ww)
-                ok = True
-                for x, y in train_pairs:
-                    Hx, Wx = x.shape
-                    if Hx % hh != 0 or Wx % ww != 0:
-                        ok = False; break
-                    if not grids_equal(block_downscale_mode_zero_inclusive(x, hh, ww), y):
-                        ok = False; break
-                if ok:
-                    return lambda g, hh=hh, ww=ww: block_downscale_mode_zero_inclusive(g, hh, ww)
-            return None
-        def fill_lines_by_anchors(a: np.ndarray):
-            g = a.copy()
-            H, W = g.shape
-            out = g.copy()
-            for r in range(H):
-                row = g[r]
-                nz = np.where(row != 0)[0]
-                if nz.size >= 2:
-                    left, right = nz[0], nz[-1]
-                    if row[left] == row[right]:
-                        out[r, :] = np.where(out[r,:]==0, row[left], out[r, :])
-            for c in range(W):
-                col = g[:, c]
-                nz = np.where(col != 0)[0]
-                if nz.size >= 2:
-                    top, bot = nz[0], nz[-1]
-                    if col[top] == col[bot]:
-                        out[:, c] = np.where(out[:,c]==0, col[top], out[:,c])
-            return out
-        
-        def _center_component(g: np.ndarray):
-            H, W = g.shape
-            cy, cx = (H-1)/2.0, (W-1)/2.0
-            comps = cc4_info(g)
-            if not comps:
-                return None
-            candidates = []
-            for c in comps:
-                r0, c0, r1, c1 = c["bbox"]
-                if r0 <= cy <= r1 and c0 <= cx <= c1:
-                    candidates.append(c)
-            if candidates:
-                candidates.sort(key=lambda c: (c["centroid"][0]-cy)**2 + (c["centroid"][1]-cx)**2)
-                return candidates[0]
-            comps.sort(key=lambda c: (c["centroid"][0]-cy)**2 + (c["centroid"][1]-cx)**2)
-            return comps[0]
-        
-        def spine_fill_through_centroid(a: np.ndarray) -> np.ndarray:
-            g = a.copy()
-            comp = _center_component(g)
-            if comp is None:
-                return g
-            colors = [g[r, c] for (r, c) in comp["coords"]]
-            col = int(np.argmax(np.bincount(np.array(colors, dtype=int), minlength=10)))
-            cy, cx = comp["centroid"]
-            cxr = int(round(cx))
-            out = g.copy()
-            out[:, cxr] = np.where(out[:, cxr]==0, col, out[:, cxr])
-            return out
+        pass
 
-        def extend_diagonals_from_seeds(a: np.ndarray):
-            g = a.copy()
-            H, W = g.shape
-            out = g.copy()
-            dirs = [(-1,1), (1,1), (-1,-1), (1,-1)]
-            for comp in cc4_info(g):
-                col = comp["color"]
-                S = set(comp["coords"])
-                for (y, x) in comp["coords"]:
-                    for dy, dx in dirs:
-                        py, px = y - dy, x - dx
-                        if (py, px) not in S:
-                            ny, nx = y, x
-                            while 0 <= ny < H and 0 <= nx < W:
-                                if out[ny,nx] == 0:
-                                    out[ny,nx] = col
-                                ny += dy; nx += dx
-            return out
-        def staircase_from_edge_seed(a: np.ndarray):
-            g = a.copy()
-            H, W = g.shape
-            out = np.zeros_like(g)
-            def run_len(vec):
-                idx = np.where(vec != 0)[0]
-                if idx.size == 0:
-                    return 0, 0
-                start, end = idx[0], idx[-1]
-                col = int(vec[idx[0]])
-                if np.all(vec[start:end+1] == col):
-                    return end-start+1, col
-                return 0, 0
-            Lr, cr = run_len(g[0, :])
-            Lc, cc = run_len(g[:, 0])
-            if Lr >= 2:
-                for i in range(min(H, Lr)):
-                    out[i, :Lr-i] = cr
-                return out
-            if Lc >= 2:
-                for j in range(min(W, Lc)):
-                    out[:Lc-j, j] = cc
-                return out
-            return g.copy()
-            
-        def op_score(op, train_pairs: list[tuple[np.ndarray, np.ndarray]]):
-            exact = 0
-            total_loss = 0
-            shape_matches = 0
-            def pal(a): return set(np.unique(a))
-            color_penalty = 0
-            for x, y in train_pairs:
-                try:
-                    py = op(x)
-                except Exception:
-                    return (10**9, 10**9, -10**9, 10**9)
-                if grids_equal(py, y):
-                    exact += 1
-                total_loss += pixel_loss(py,y)
-                shape_matches += shape_match(py, y)
-                color_penalty += len(pal(py) ^ pal(y))
-            return (-exact, total_loss, -shape_matches, color_penalty)
-        train_pairs: list[tuple[np.ndarray, np.ndarray]] = []
-        for s in arc_problem.training_set():
-            x = s.get_input_data().data().copy()
-            y = s.get_output_data().data().copy()
-            train_pairs.append((x, y))
-        test_in = arc_problem.test_set().get_input_data().data().copy()
-        
-        gated_ops: list = []
-        
-
-        for name in dihedral_names():
-            op = op_dihedral(name)
-            try:
-                if all(grids_equal(op(x), y) for x, y in train_pairs):
-                    gated_ops.append(op)
-            except Exception:
-                pass
-                
-        try:
-            if all(grids_equal(compress_left(x, 0), y) for x, y in train_pairs):
-                gated_ops.append(op_compress_left(0))
-        except Exception:
-            pass
-        try:
-            if all(grids_equal(compress_up(x, 0), y) for x, y in train_pairs):
-                gated_ops.append(op_compress_up(0))
-        except Exception:
-            pass
-        nonzero_pool = [y[y != 0] for _x, y in train_pairs if np.any(y != 0)]
-        dom_out = most_freq(np.concatenate(nonzero_pool)) if nonzero_pool else 0
-        try:
-            if all(grids_equal(object_repaint(x, dom_out), y) for x, y in train_pairs):
-                gated_ops.append(op_object_repaint(dom_out))
-        except Exception:
-            pass
-        gmap = {}
-        ok_map = True
-        for x, y in train_pairs:
-            cm = cmap_from_xy(x, y)
-            if cm is None:
-                ok_map = False
-                break
-            for k,v in cm.items():
-                if k in gmap and gmap[k] != v:
-                    ok_map = False
-                    break
-                gmap[k] = v
-            if not ok_map:
-                break
-        if ok_map and gmap:
-            def cmap_op(g, cm=gmap): return apply_cmap(g, cm)
-            try:
-                if all(grids_equal(cmap_op(x), y) for x,y in train_pairs):
-                    gated_ops.append(cmap_op)
-            except Exception:
-                pass
-        
-        rpt = try_infer_repeat_xy(train_pairs)
-        if rpt is not None:
-            kh, kw = rpt
-            def rpt_op(g, kh=kh, kw=kw): return repeat_upscale(g, kh, kw)
-            gated_ops.append(rpt_op)
-        dn = try_infer_downscale(train_pairs)
-        if dn is not None:
-            gated_ops.append(dn)
-            
-        try:
-            if all(grids_equal(fill_lines_by_anchors(x), y) for x, y in train_pairs):
-                gated_ops.append(lambda g: fill_lines_by_anchors(g))
-        except Exception:
-            pass
-        try:
-            if all(grids_equal(spine_fill_through_centroid(x), y) for x,y in train_pairs):
-                gated_ops.append(lambda g: spine_fill_through_centroid(g))
-        except Exception:
-            pass
-            
-        try:
-            if all(grids_equal(extend_diagonals_from_seeds(x), y) for x,y in train_pairs):
-                gated_ops.append(lambda g: extend_diagonals_from_seeds(g))
-        except Exception:
-            pass
-            
-        try:
-            if all(grids_equal(staircase_from_edge_seed(x), y) for x,y in train_pairs):
-                gated_ops.append(lambda g: staircase_from_edge_seed(g))
-        except Exception:
-            pass
-            
-        preds = []
-        seen = set()
-        def add_pred(p: np.ndarray):
-            for q in preds:
-                if grids_equal(p, q):
-                    return
-            if len(preds) < 3:
-                preds.append(p)
-        if gated_ops:
-            for op in gated_ops:
-                try:
-                    p = op(test_in)
-                    key = (p.shape, tuple(p.ravel().tolist()[:64]))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    add_pred(p)
-                    if len(preds) >= 3:
-                        break
-                except Exception:
-                    continue
-            if preds:
-                return preds[:3]
-                
-                
-        candidate_ops = [op_dihedral(n) for n in dihedral_names()]
-        candidate_ops += [op_compress_left(0), op_compress_up(0)]
-        candidate_ops += [lambda g: fill_lines_by_anchors(g),
-                          lambda g: spine_fill_through_centroid(g),
-                          lambda g: extend_diagonals_from_seeds(g),
-                          lambda g: staircase_from_edge_seed(g)]
-      
-        for dy in (-1, 0, 1):
-            for dx in (-1, 0, 1):
-                if dy == 0 and dx == 0:
-                    continue
-                candidate_ops.append(op_translate(dy, dx, 0))
-                
-        if ok_map and gmap:
-            candidate_ops.append(lambda g, cm=gmap: apply_cmap(g, cm))
-        if nonzero_pool:
-            candidate_ops.append(op_object_repaint(dom_out))
-            
-        
-        scored = []
-        for op in candidate_ops:
-            try:
-                s = op_score(op, train_pairs)
-            except Exception:
-                s = (10**9, 10**9, -10**9, 10**9)
-            scored.append((s, op))
-            
-        scored.sort(key=lambda t: t[0])
-        top_ops = [op for (_s, op) in scored[:self.TOP_K_OPS]]
-        
-        for op in top_ops:
-            try:
-                p = op(test_in)
-                add_pred(p)
-                if len(preds) >= 3:
-                    break
-            except Exception:
-                continue
-                
+    def make_predictions(self, arc_problem) -> List[np.ndarray]:
+        preds = choose_predictions(arc_problem)
         if preds:
-            return preds[:3]
-            
-        core_ops = [op_dihedral(n) for n in dihedral_names()]
-        core_ops += [op_compress_left(0), op_compress_up(0)]
-        for dy in (-1, 1):
-            for dx in (-1, 1):
-                core_ops.append(op_translate(dy, dx, 0))
-        BeamItem = tuple[int, list]
-        beam: list[BeamItem] = [(0, [])]
-        best_exact: list[list] = []
-        best_approx: list[tuple[int, list]] = []
-        
-        L0, _ = sequence_fits_all(train_pairs, [])
-        if L0 == 0:
-            best_exact.append([])
-            
-        for _depth in range(1, self.MAX_DEPTH + 1):
-            new_beam: list[BeamItem] = []
-            for _cur_loss, seq in beam:
-                for op in core_ops:
-                    seq2 = seq + [op]
-                    L, _fails = sequence_fits_all(train_pairs, seq2)
-                    new_beam.append((L, seq2))
-            new_beam.sort(key=lambda t: t[0])
-            beam = new_beam[:self.BEAM_WIDTH]
-            for L, seq in beam:
-                if L == 0:
-                    best_exact.append(seq)
-                else:
-                    best_approx.append((L, seq))
+            return preds[:MAX_PREDS]
 
-        for seq in best_exact[:3]:
-            add_pred(apply_seq(test_in, seq))
-            if len(preds) >= 3:
-                break
-        if len(preds) < 3 and best_approx:
-            best_approx.sort(key=lambda t: t[0])
-            for L, seq in best_approx[:3]:
-                add_pred(apply_seq(test_in, seq))
-                if len(preds) >= 3:
-                    break
-               
-        return preds[:3] if preds else[test_in.copy()]
+        # Baseline fallback so CSV always fills:
+        test_in = arc_problem.test_set().get_input_data().data()
+        return [test_in.copy()]
